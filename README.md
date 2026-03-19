@@ -30,6 +30,20 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
+## Features
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| OpenAI-compatible API | ✓ | `/v1/chat/completions`, `/v1/models`, `/health` |
+| SSE streaming | ✓ | Real-time token-by-token streaming |
+| KV-cache | ✓ | Cached phase angles and value projections for harmonic attention |
+| BPE tokenizer | ✓ | HuggingFace tokenizer.json format |
+| Wave memory | ✓ | Persistent experience accumulation across conversations (.kwmf) |
+| Bearer token auth | ✓ | Optional `--api-key` for `/v1/*` endpoints |
+| GPU acceleration | ✓ | Optional `--features gpu` for wgpu matmul acceleration |
+| WCHK + KCHK checkpoints | ✓ | Native wave-engine format + legacy kerr-engine compatibility |
+| LM Studio verified | ✓ | Tested with LM Studio 0.4.6 |
+
 ## Usage
 
 ```
@@ -142,7 +156,7 @@ The server implements the wave-engine forward pass for inference. The architectu
 x = x + attention(LN(x)) + FFN(LN(x))
 ```
 
-**Attention** — Harmonic coherence scoring: `cos(n × Δφ)` where `n` is a learned harmonic number and `Δφ` is the phase difference between positions. Frozen during training, frozen during inference.
+**Attention** — Harmonic coherence scoring: `cos(n × Δφ)` where `n` is a learned harmonic number and `Δφ` is the phase difference between positions. Frozen during training, frozen during inference. KV-cache stores phase angles (scalars) and value projections per head — simpler than standard transformer KV-cache because phases are scalars and frozen weights never invalidate the cache.
 
 **FFN** — Dual-maestro Kerr-ODE: `input → maestro_in (768→16→768) → ODE (RK4) → maestro_out (768→16→768) → out_proj (768→768)`.
 
@@ -154,7 +168,7 @@ src/
 ├── server.rs        Axum router, auth middleware, graceful shutdown
 ├── handlers.rs      Request handlers, SSE streaming, memory accumulation
 ├── api_types.rs     OpenAI protocol types (serde structs)
-├── model.rs         Forward pass, weight structs, Kerr-ODE with memory injection
+├── model.rs         Forward pass, weight structs, KV-cache, Kerr-ODE with memory
 ├── checkpoint.rs    Checkpoint loader (WCHK and legacy KCHK)
 ├── inference.rs     Token generation with temperature/top-k/top-p sampling
 ├── prompt.rs        Vocabulary, text encode/decode, chat message formatting
@@ -167,11 +181,9 @@ src/
 
 ## Known Limitations
 
-**No KV-cache** — The server re-runs the full forward pass for every new token generated. At 24 layers / 768-dim, this means ~1-2 seconds per token — a 100-token response takes minutes. This is the #1 performance bottleneck. At 4 layers / 128-dim, inference is instant (~1ms per token).
+**GPU forward pass needs updating** — The `gpu_forward.rs` module references the old kerr-server architecture (sequential blocks, single maestro, QKV attention). It needs rewriting to match the current wave-engine architecture (parallel blocks, dual maestro, harmonic coherence attention). CPU inference works correctly. GPU inference with `--features gpu` may not compile against the current model structs.
 
-**CPU-only by default** — The GPU feature (`--features gpu`) accelerates matmul operations via wgpu but the ODE and attention scoring remain on CPU. For small models this is fine. For large models, GPU inference with KV-cache is needed.
-
-**No concurrent requests** — The server handles one request at a time. Sequential inference.
+**No concurrent requests** — The server handles one request at a time. Sequential inference. Batched dispatch using the engine's existing batch patterns would allow serving multiple users simultaneously.
 
 ## Dependencies
 
@@ -205,16 +217,16 @@ The maintainer ([Marco Da Cunha](https://github.com/atech-hub)) is an IT systems
 - Every PR must demonstrate that the four endpoints still work: health, models, non-streaming chat, and SSE streaming.
 - The maintainer merges based on testing and description, not code review. Be clear about what you changed and why.
 
-**Known targets for contributors (priority order):**
+**Known targets for contributors:**
 
 | Target | Impact | Difficulty |
 |--------|--------|------------|
-| **KV-cache** | 100x faster generation at 768-dim+ | Medium-Large |
-| **GPU inference pipeline** | Full forward pass on GPU | Medium |
-| Vocab embedded in checkpoint | Eliminate data file requirement | Small |
+| **Fix gpu_forward.rs** for wave-engine architecture | GPU inference at 768-dim+ | Medium |
+| Batched GPU dispatch | Use engine's batch patterns for multi-position inference | Medium |
+| Vocab embedded in checkpoint | Eliminate data file requirement at serve time | Small |
 | Streaming memory accumulation | Currently only non-streaming updates memory | Small |
-| Concurrent request handling | Multi-user support | Medium |
-| Model hot-reload | Swap models without restart | Medium |
+| Concurrent request handling | Multi-user serving via batched dispatch | Medium |
+| Model hot-reload | Swap models without server restart | Medium |
 
 ## Related
 

@@ -44,7 +44,7 @@ fn main() {
     // Parse optional flags — need to scan for --bpe before determining if data arg is required
     let mut port: u16 = 8080;
     let mut host = "127.0.0.1".to_string();
-    let mut model_name = "kerr-ode".to_string();
+    let mut model_name = "wave-engine".to_string();
     let mut api_key: Option<String> = None;
     let mut word_level = false;
     let mut bpe_path: Option<String> = None;
@@ -198,7 +198,7 @@ fn print_help() {
     println!("    wave-server <CHECKPOINT> [DATA] [OPTIONS]");
     println!();
     println!("ARGUMENTS:");
-    println!("    CHECKPOINT      Path to a .bin checkpoint file trained by kerr-engine.");
+    println!("    CHECKPOINT      Path to a .bin checkpoint file trained by wave-engine.");
     println!("                    v2 checkpoints are self-describing (architecture stored");
     println!("                    in the header). v1 checkpoints need --n-bands etc.");
     println!();
@@ -210,7 +210,7 @@ fn print_help() {
     println!("    --port N        Listen port                          [default: 8080]");
     println!("    --host ADDR     Bind address. Use 0.0.0.0 to listen  [default: 127.0.0.1]");
     println!("                    on all interfaces (LAN access).");
-    println!("    --model-name S  Model name returned in API responses  [default: kerr-ode]");
+    println!("    --model-name S  Model name returned in API responses  [default: wave-engine]");
     println!("    --api-key KEY   Require Bearer token authentication. Clients must send");
     println!("                    'Authorization: Bearer <KEY>' header. The /health endpoint");
     println!("                    stays open without auth.              [default: none]");
@@ -231,7 +231,7 @@ fn print_help() {
     println!();
     println!("ARCHITECTURE (v1 checkpoints only — v2 self-describes):");
     println!("    These flags are only needed for v1 checkpoints that don't store their");
-    println!("    architecture in the header. v2 checkpoints (saved by kerr-engine v0.2+)");
+    println!("    architecture in the header. v2 checkpoints (saved by wave-engine v0.2+)");
     println!("    auto-detect all of these.");
     println!();
     println!("    --n-bands N     Harmonic frequency bands              [default: 64]");
@@ -272,10 +272,10 @@ fn print_help() {
     println!("    - curl:");
     println!("        curl http://127.0.0.1:8080/v1/chat/completions \\");
     println!("          -H 'Content-Type: application/json' \\");
-    println!("          -d '{{\"model\":\"kerr-ode\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}'");
+    println!("          -d '{{\"model\":\"wave-engine\",\"messages\":[{{\"role\":\"user\",\"content\":\"Hello\"}}]}}'");
     println!();
     println!("    Verified with LM Studio 0.4.6. Streaming and non-streaming both supported.");
     println!();
     println!("SOURCE: https://github.com/atech-hub/wave-server");
-    println!("ENGINE: https://github.com/atech-hub/kerr-engine");
+    println!("ENGINE: https://github.com/atech-hub/wave-engine");
 }

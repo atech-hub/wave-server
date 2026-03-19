@@ -264,7 +264,7 @@ pub async fn handle_models(
             id: state.config.model_name.clone(),
             object: "model".to_string(),
             created: 0,
-            owned_by: "kerr-engine".to_string(),
+            owned_by: "wave-engine".to_string(),
         }],
     })
 }

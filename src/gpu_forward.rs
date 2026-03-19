@@ -1,6 +1,6 @@
 //! GPU-accelerated forward pass using the server's own GpuAccelerator.
 //!
-//! No dependency on kerr-engine. Uses gpu.rs for matmul dispatch.
+//! No dependency on wave-engine. Uses gpu.rs for matmul dispatch.
 //! The Kerr-ODE, layer norm, and attention scores stay on CPU
 //! (they're O(n) or memory-bound, not the bottleneck at 768-dim+).
 

@@ -1,7 +1,7 @@
 //! Self-contained GPU accelerator for inference.
 //!
 //! Provides GPU-accelerated matrix-vector multiply for the forward pass.
-//! No dependency on kerr-engine. Compiles the matvec shader at startup,
+//! No dependency on wave-engine. Compiles the matvec shader at startup,
 //! pre-allocates buffers, dispatches via wgpu. The Kerr-ODE, layer norm,
 //! and attention scores stay on CPU (not the bottleneck).
 

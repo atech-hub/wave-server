@@ -50,7 +50,7 @@ fn main() {
     let mut bpe_path: Option<String> = None;
     let mut memory_path: Option<String> = None;
     let mut use_gpu = false;
-    let mut config = ModelConfig::default_128();
+    let mut config = ModelConfig::default_768();
     let mut has_arch_flags = false;
 
     // First pass: find --bpe and --memory before positional arg parsing
@@ -105,16 +105,12 @@ fn main() {
     config.validate();
 
     // Load model from checkpoint
-    // v2 checkpoints auto-detect config; v1 uses CLI flags or default_128
     println!("Loading checkpoint: {checkpoint_path}");
-    let model = if has_arch_flags {
-        checkpoint::load_with_config(checkpoint_path, config)
-    } else {
-        checkpoint::load(checkpoint_path)
-    }.expect("Failed to load checkpoint");
-    println!("  Model: {} layers, {} embd ({} bands), {} vocab, {} params",
+    let config_arg = if has_arch_flags { Some(config) } else { None };
+    let (model, _iter, _lr) = checkpoint::load_checkpoint(checkpoint_path, config_arg);
+    println!("  Model: {} layers, {} embd ({} bands), {} vocab",
         model.config.n_layers, model.config.n_embd(), model.config.n_bands,
-        model.vocab_size, crate::checkpoint::count_params(&model));
+        model.vocab_size);
 
     // Load vocabulary
     let vocab = if let Some(ref bpe_file) = bpe_path {

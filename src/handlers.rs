@@ -98,7 +98,7 @@ fn update_memory(state: &AppState, all_tokens: &[usize], mem_offsets: Option<&Me
     // Extract ODE states (truncate to block_size)
     let block_size = state.model.config.block_size;
     let start = if all_tokens.len() > block_size { all_tokens.len() - block_size } else { 0 };
-    let ode_states = state.model.extract_ode_states(&all_tokens[start..], mem_arg);
+    let ode_states = state.model.extract_ode_states(&all_tokens[start..]);
 
     // Merge into persistent memory using beta
     let beta = memory.config.beta;

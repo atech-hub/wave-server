@@ -108,6 +108,60 @@ pub struct WaveBlockWeights {
     pub ffn: KerrDualMaestroWeights,
 }
 
+// ─── KV-Cache ──────────────────────────────────────────────
+
+/// Per-layer KV cache for harmonic coherence attention.
+/// "K" = phase angles (scalar per head), "V" = projected values (head_dim per head).
+/// Simpler than standard transformer KV-cache because phases are scalars.
+struct LayerKvCache {
+    /// Cached phase angles: [n_head][n_cached_positions]
+    phases: Vec<Vec<f32>>,
+    /// Cached value projections: [n_head][n_cached_positions][head_dim]
+    values: Vec<Vec<Vec<f32>>>,
+    /// Cached bucket assignments: [n_head][n_cached_positions]
+    buckets: Vec<Vec<usize>>,
+}
+
+/// Full KV-cache across all layers.
+pub struct KvCache {
+    layers: Vec<LayerKvCache>,
+    /// Hidden states entering each layer (needed for FFN on new token).
+    /// [n_layers][n_cached_positions][n_embd] — the hidden state before each block.
+    hidden_per_layer: Vec<Vec<Vec<f32>>>,
+    /// Number of positions currently cached.
+    n_cached: usize,
+}
+
+impl KvCache {
+    /// Create empty cache for a model.
+    pub fn new(config: &ModelConfig) -> Self {
+        let n_head = config.n_head;
+        let n_layers = config.n_layers;
+        Self {
+            layers: (0..n_layers).map(|_| LayerKvCache {
+                phases: vec![Vec::new(); n_head],
+                values: vec![Vec::new(); n_head],
+                buckets: vec![Vec::new(); n_head],
+            }).collect(),
+            hidden_per_layer: vec![Vec::new(); n_layers],
+            n_cached: 0,
+        }
+    }
+
+    /// Clear the cache (new conversation).
+    pub fn clear(&mut self) {
+        for layer in &mut self.layers {
+            for h in &mut layer.phases { h.clear(); }
+            for h in &mut layer.values { h.clear(); }
+            for h in &mut layer.buckets { h.clear(); }
+        }
+        for h in &mut self.hidden_per_layer { h.clear(); }
+        self.n_cached = 0;
+    }
+
+    pub fn len(&self) -> usize { self.n_cached }
+}
+
 /// Full model weights.
 pub struct ModelWeights {
     pub config: ModelConfig,
@@ -442,10 +496,197 @@ impl ModelWeights {
         tokens: &[usize],
         memory_offsets: Option<&[(&[f32], &[f32])]>,
     ) -> Vec<Vec<f32>> {
-        // TODO: wire memory injection into ODE forward
-        // For now, delegates to base forward
         let _ = memory_offsets;
         self.forward(tokens)
+    }
+
+    /// Prefill the KV-cache with prompt tokens (full forward, caches all positions).
+    pub fn prefill(&self, tokens: &[usize], cache: &mut KvCache) -> Vec<f32> {
+        cache.clear();
+        let t = tokens.len();
+        let n_embd = self.config.n_embd();
+        let n_bands = self.config.n_bands;
+        let n_head = self.config.n_head;
+        let head_dim = n_embd / n_head;
+
+        let mut hidden: Vec<Vec<f32>> = tokens.iter().enumerate().map(|(pos, &tok)| {
+            let mut h = vec![0.0f32; n_embd];
+            let tok_idx = tok.min(self.vocab_size - 1);
+            let pos_idx = pos.min(self.config.block_size - 1);
+            for i in 0..n_embd { h[i] = self.wte[tok_idx][i] + self.wpe[pos_idx][i]; }
+            h
+        }).collect();
+
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            let normed: Vec<Vec<f32>> = hidden.iter()
+                .map(|h| layer_norm(h, &block.ln.weight, &block.ln.bias))
+                .collect();
+
+            // Cache phases and values for all positions
+            let kv = &mut cache.layers[layer_idx];
+            for head in 0..n_head {
+                let offset = head * head_dim;
+                for pos in 0..t {
+                    let phase = project_phase(&normed[pos],
+                        &block.attn.heads[head].phase_proj_w,
+                        &block.attn.heads[head].phase_proj_b);
+                    kv.phases[head].push(phase);
+
+                    let normalized = ((phase % std::f32::consts::TAU) + std::f32::consts::TAU) % std::f32::consts::TAU;
+                    let bucket = ((normalized / (std::f32::consts::TAU / 8.0)) as usize).min(7);
+                    kv.buckets[head].push(bucket);
+
+                    let mut v = vec![0.0f32; head_dim];
+                    for d in 0..head_dim {
+                        let mut sum = 0.0f32;
+                        for j in 0..head_dim {
+                            sum += block.attn.heads[head].v_proj_w[d][j] * normed[pos][offset + j];
+                        }
+                        v[d] = sum + block.attn.heads[head].v_proj_b[d];
+                    }
+                    kv.values[head].push(v);
+                }
+            }
+
+            // Full attention for all positions (same as uncached)
+            let attn_out = wave_attention_forward(&block.attn, &normed, n_bands);
+
+            // FFN for all positions
+            let ffn_out: Vec<Vec<f32>> = normed.iter()
+                .map(|x| dual_maestro_ffn_forward(&block.ffn, x))
+                .collect();
+
+            hidden = (0..t).map(|i| {
+                let mut v = vec![0.0f32; n_embd];
+                for j in 0..n_embd { v[j] = hidden[i][j] + attn_out[i][j] + ffn_out[i][j]; }
+                v
+            }).collect();
+
+            // Cache hidden states for this layer (used if we need ODE states)
+            cache.hidden_per_layer[layer_idx] = hidden.clone();
+        }
+
+        cache.n_cached = t;
+
+        // Return last position's logits
+        let last = layer_norm(&hidden[t - 1], &self.ln_f.weight, &self.ln_f.bias);
+        let mut logits = vec![0.0f32; self.vocab_size];
+        for v in 0..self.vocab_size {
+            for j in 0..n_embd { logits[v] += self.lm_head[v][j] * last[j]; }
+        }
+        logits
+    }
+
+    /// Generate one token using KV-cache. O(1) per layer instead of O(T).
+    /// Only processes the new position against cached phases/values.
+    pub fn forward_one_cached(&self, token: usize, pos: usize, cache: &mut KvCache) -> Vec<f32> {
+        let n_embd = self.config.n_embd();
+        let n_bands = self.config.n_bands;
+        let n_head = self.config.n_head;
+        let head_dim = n_embd / n_head;
+        let pos_idx = pos.min(self.config.block_size - 1);
+
+        // Embed new token
+        let tok_idx = token.min(self.vocab_size - 1);
+        let mut h = vec![0.0f32; n_embd];
+        for i in 0..n_embd { h[i] = self.wte[tok_idx][i] + self.wpe[pos_idx][i]; }
+
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            let normed = layer_norm(&h, &block.ln.weight, &block.ln.bias);
+
+            // ─── Attention: score new position against ALL cached positions ───
+            let kv = &mut cache.layers[layer_idx];
+            let n_cached = kv.phases[0].len();
+            let mut attn_out = vec![0.0f32; n_embd];
+
+            for head in 0..n_head {
+                let harmonic_n = softplus(block.attn.heads[head].harmonic_raw);
+                let offset = head * head_dim;
+
+                // New position's phase and value
+                let new_phase = project_phase(&normed,
+                    &block.attn.heads[head].phase_proj_w,
+                    &block.attn.heads[head].phase_proj_b);
+
+                let mut new_v = vec![0.0f32; head_dim];
+                for d in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for j in 0..head_dim {
+                        sum += block.attn.heads[head].v_proj_w[d][j] * normed[offset + j];
+                    }
+                    new_v[d] = sum + block.attn.heads[head].v_proj_b[d];
+                }
+
+                // Score against all cached positions + self
+                let total = n_cached + 1; // cached + new
+                let mut scores = vec![0.0f32; total];
+
+                // Sparse: only score same + adjacent buckets
+                let new_normalized = ((new_phase % std::f32::consts::TAU) + std::f32::consts::TAU) % std::f32::consts::TAU;
+                let new_bucket = ((new_normalized / (std::f32::consts::TAU / 8.0)) as usize).min(7);
+
+                for ki in 0..n_cached {
+                    let ki_bucket = kv.buckets[head][ki];
+                    let bucket_diff = (new_bucket as isize - ki_bucket as isize).unsigned_abs();
+                    let adjacent = bucket_diff <= 1 || bucket_diff >= 7; // wrapping
+                    if adjacent || ki + 1 >= n_cached { // always attend to last cached
+                        let delta = new_phase - kv.phases[head][ki];
+                        scores[ki] = (harmonic_n * delta).cos();
+                    } else {
+                        scores[ki] = f32::NEG_INFINITY;
+                    }
+                }
+                // Self-attention
+                scores[n_cached] = 1.0;
+
+                // Softmax
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut exp_sum = 0.0f32;
+                for s in &mut scores {
+                    if *s > f32::NEG_INFINITY {
+                        *s = (*s - max_s).exp();
+                        exp_sum += *s;
+                    } else {
+                        *s = 0.0;
+                    }
+                }
+                if exp_sum > 0.0 { for s in &mut scores { *s /= exp_sum; } }
+
+                // Weighted sum of cached values + self
+                for d in 0..head_dim {
+                    let mut sum = 0.0f32;
+                    for ki in 0..n_cached {
+                        if scores[ki] > 0.0 { sum += scores[ki] * kv.values[head][ki][d]; }
+                    }
+                    sum += scores[n_cached] * new_v[d]; // self
+                    attn_out[offset + d] = sum;
+                }
+
+                // Cache new position
+                kv.phases[head].push(new_phase);
+                kv.values[head].push(new_v);
+                kv.buckets[head].push(new_bucket);
+            }
+
+            // Output projection for attention
+            let attn_projected = linear(&block.attn.out_proj_w, &block.attn.out_proj_b, &attn_out);
+
+            // ─── FFN: process just this one token ───
+            let ffn_out = dual_maestro_ffn_forward(&block.ffn, &normed);
+
+            // Parallel residual
+            for j in 0..n_embd { h[j] = h[j] + attn_projected[j] + ffn_out[j]; }
+        }
+
+        cache.n_cached += 1;
+
+        // LM head
+        let post_ln = layer_norm(&h, &self.ln_f.weight, &self.ln_f.bias);
+        let mut logits = vec![0.0f32; self.vocab_size];
+        for v in 0..self.vocab_size {
+            for j in 0..n_embd { logits[v] += self.lm_head[v][j] * post_ln[j]; }
+        }
+        logits
     }
 
     /// Extract ODE states for memory accumulation.

@@ -3,7 +3,11 @@ name = "wave-server"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "OpenAI-compatible API server for wave-engine models"
+description = "OpenAI-compatible API server for wave-engine models with wave memory support"
+repository = "https://github.com/atech-hub/wave-server"
+authors = ["Marco Da Cunha"]
+keywords = ["machine-learning", "inference", "openai-api", "wave-coherence", "server"]
+categories = ["web-programming::http-server", "science"]
 
 [features]
 default = []

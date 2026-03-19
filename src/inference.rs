@@ -1,9 +1,9 @@
 //! Generation loop and sampling — the core inference engine.
 //!
-//! Uses model.forward() (inference-only CPU path in model.rs).
-//! No KV-cache in v0.1 — re-runs full forward per token.
+//! KV-cache enabled: prefill prompt once, then O(1) per new token.
+//! Harmonic attention KV-cache is simpler than standard — phases are scalars.
 
-use crate::model::ModelWeights;
+use crate::model::{ModelWeights, KvCache};
 use crate::rng::Rng;
 
 use crate::prompt::Vocab;
@@ -35,7 +35,7 @@ pub struct MemoryOffsets {
     pub offsets: Vec<(Vec<f32>, Vec<f32>)>, // [(r_offset, s_offset)] per ODE layer
 }
 
-/// Generate all tokens at once (non-streaming).
+/// Generate all tokens at once (non-streaming) with KV-cache.
 pub fn generate(
     model: &ModelWeights,
     prompt_tokens: &[usize],
@@ -43,24 +43,16 @@ pub fn generate(
     vocab: &Vocab,
     memory: Option<&MemoryOffsets>,
 ) -> GenerationResult {
+    let _ = memory; // TODO: wire memory into cached forward
     let mut rng = make_rng();
-    let block_size = model.config.block_size;
     let mut tokens = prompt_tokens.to_vec();
     let mut generated = Vec::new();
 
-    // Build offset slices for forward_with_memory
-    let offset_slices: Option<Vec<(&[f32], &[f32])>> = memory.map(|m|
-        m.offsets.iter().map(|(r, s)| (r.as_slice(), s.as_slice())).collect()
-    );
-    let mem_arg = offset_slices.as_deref();
+    // Prefill: process entire prompt, populate KV-cache
+    let mut cache = KvCache::new(&model.config);
+    let mut logits = model.prefill(prompt_tokens, &mut cache);
 
     for _ in 0..config.max_tokens {
-        let start = if tokens.len() > block_size { tokens.len() - block_size } else { 0 };
-        let context = &tokens[start..];
-
-        let logits_all = model.forward_with_memory(context, mem_arg);
-        let mut logits = logits_all.last().unwrap().clone();
-
         if let Some(penalty) = config.repetition_penalty {
             if penalty != 1.0 {
                 apply_repetition_penalty(&mut logits, &tokens, penalty);
@@ -70,6 +62,10 @@ pub fn generate(
         let token = sample_token(&logits, config, &mut rng);
         tokens.push(token);
         generated.push(token);
+
+        // Decode next: O(1) per layer using KV-cache
+        let pos = tokens.len() - 1;
+        logits = model.forward_one_cached(token, pos, &mut cache);
     }
 
     let text = vocab.decode(&generated);
@@ -120,7 +116,7 @@ where
     GenerationResult { tokens: generated, text }
 }
 
-/// Generate tokens one at a time, calling on_token for each.
+/// Generate tokens one at a time with KV-cache, calling on_token for each.
 /// Returns false from on_token to stop early (e.g. client disconnect).
 pub fn generate_streaming<F>(
     model: &ModelWeights,
@@ -132,22 +128,15 @@ pub fn generate_streaming<F>(
 ) where
     F: FnMut(TokenEvent) -> bool,
 {
+    let _ = memory; // TODO: wire memory into cached forward
     let mut rng = make_rng();
-    let block_size = model.config.block_size;
     let mut tokens = prompt_tokens.to_vec();
 
-    let offset_slices: Option<Vec<(&[f32], &[f32])>> = memory.map(|m|
-        m.offsets.iter().map(|(r, s)| (r.as_slice(), s.as_slice())).collect()
-    );
-    let mem_arg = offset_slices.as_deref();
+    // Prefill: process entire prompt, populate KV-cache
+    let mut cache = KvCache::new(&model.config);
+    let mut logits = model.prefill(prompt_tokens, &mut cache);
 
     for i in 0..config.max_tokens {
-        let start = if tokens.len() > block_size { tokens.len() - block_size } else { 0 };
-        let context = &tokens[start..];
-
-        let logits_all = model.forward_with_memory(context, mem_arg);
-        let mut logits = logits_all.last().unwrap().clone();
-
         if let Some(penalty) = config.repetition_penalty {
             if penalty != 1.0 {
                 apply_repetition_penalty(&mut logits, &tokens, penalty);
@@ -163,6 +152,10 @@ pub fn generate_streaming<F>(
         if !on_token(TokenEvent { text, done }) {
             break;
         }
+
+        // Next token: O(1) per layer using KV-cache
+        let pos = tokens.len() - 1;
+        logits = model.forward_one_cached(token, pos, &mut cache);
     }
 }
 

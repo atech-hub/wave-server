@@ -1,218 +1,231 @@
-//! GPU-accelerated forward pass using the server's own GpuAccelerator.
+//! GPU-accelerated forward pass for wave-engine models.
 //!
-//! No dependency on wave-engine. Uses gpu.rs for matmul dispatch.
-//! The Kerr-ODE, layer norm, and attention scores stay on CPU
-//! (they're O(n) or memory-bound, not the bottleneck at 768-dim+).
+//! Routes large matmuls (out_proj, lm_head) through GpuAccelerator.
+//! Harmonic coherence attention scoring stays CPU (phase-based, frozen).
+//! Kerr-ODE stays CPU (sequential RK4 integration).
+//! Layer norm stays CPU (O(n), not compute-bound).
 
 use crate::gpu::GpuAccelerator;
 use crate::model::*;
 
-/// GPU-backed forward pass with optional wave memory injection.
-pub fn forward_with_memory_gpu(
+/// GPU-accelerated forward pass. Matches model.rs CPU forward exactly
+/// but routes 768×768 matmuls through GPU.
+pub fn forward_gpu(
     model: &ModelWeights,
     tokens: &[usize],
-    memory_offsets: Option<&[(&[f32], &[f32])]>,
     gpu: &mut GpuAccelerator,
 ) -> Vec<Vec<f32>> {
     let t = tokens.len();
     let n_embd = model.config.n_embd();
-    assert!(t <= model.config.block_size);
+    let n_bands = model.config.n_bands;
+    let n_head = model.config.n_head;
+    let head_dim = n_embd / n_head;
 
-    // Embedding + positional encoding (CPU — lookup, not compute)
-    let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(t);
-    for (pos, &tok) in tokens.iter().enumerate() {
+    // Embed (CPU — lookup)
+    let mut hidden: Vec<Vec<f32>> = tokens.iter().enumerate().map(|(pos, &tok)| {
         let mut h = vec![0.0f32; n_embd];
-        for i in 0..n_embd { h[i] = model.wte_phase[tok][i] + model.wpe[pos][i]; }
-        hidden.push(h);
-    }
-
-    // Process through blocks
-    let mut ode_layer = 0usize;
-    for block in &model.blocks {
-        let mem = match (&block.ffn, memory_offsets) {
-            (FfnWeights::KerrMaestro(_), Some(offsets)) if ode_layer < offsets.len() => {
-                let m = Some(offsets[ode_layer]);
-                ode_layer += 1;
-                m
-            }
-            (FfnWeights::KerrMaestro(_), _) => { ode_layer += 1; None }
-            _ => None,
-        };
-        hidden = forward_block_gpu(model, block, &hidden, mem, gpu);
-    }
-
-    // Final layer norm (CPU) + LM head (GPU)
-    let mut logits = Vec::with_capacity(t);
-    for h in &hidden {
-        let normed = layer_norm_cpu(h, &model.ln_f.weight, &model.ln_f.bias);
-        let l = gpu.linear_no_bias(&model.lm_head, &normed);
-        logits.push(l);
-    }
-
-    logits
-}
-
-fn forward_block_gpu(
-    model: &ModelWeights,
-    block: &BlockWeights,
-    hidden: &[Vec<f32>],
-    memory: Option<(&[f32], &[f32])>,
-    gpu: &mut GpuAccelerator,
-) -> Vec<Vec<f32>> {
-    let t = hidden.len();
-    let n_embd = model.config.n_embd();
-
-    // Attention: ln1 (CPU) → Q/K/V projection (GPU) → scores (CPU) → out_proj (GPU)
-    let normed_1: Vec<Vec<f32>> = hidden.iter()
-        .map(|h| layer_norm_cpu(h, &block.ln_1.weight, &block.ln_1.bias))
-        .collect();
-    let attn_out = attention_gpu(model, &block.attn, &normed_1, gpu);
-    let mut h: Vec<Vec<f32>> = (0..t).map(|i| {
-        let mut v = vec![0.0f32; n_embd];
-        for j in 0..n_embd { v[j] = hidden[i][j] + attn_out[i][j]; }
-        v
+        let tok_idx = tok.min(model.vocab_size - 1);
+        let pos_idx = pos.min(model.config.block_size - 1);
+        for i in 0..n_embd { h[i] = model.wte[tok_idx][i] + model.wpe[pos_idx][i]; }
+        h
     }).collect();
 
-    // FFN: ln2 (CPU) → Kerr-ODE (CPU) + Maestro projections (GPU) → out_proj (GPU)
-    let normed_2: Vec<Vec<f32>> = h.iter()
-        .map(|x| layer_norm_cpu(x, &block.ln_2.weight, &block.ln_2.bias))
-        .collect();
-    let ffn_out = match &block.ffn {
-        FfnWeights::PerBand(w) => per_band_gpu(w, &normed_2, gpu),
-        FfnWeights::KerrMaestro(w) => kerr_maestro_gpu(model, w, &normed_2, memory, gpu),
-    };
-    for i in 0..t {
-        for j in 0..n_embd { h[i][j] += ffn_out[i][j]; }
+    // Parallel blocks: x = x + attn(LN(x)) + FFN(LN(x))
+    for block in &model.blocks {
+        let normed: Vec<Vec<f32>> = hidden.iter()
+            .map(|h| layer_norm_cpu(h, &block.ln.weight, &block.ln.bias))
+            .collect();
+
+        // ─── Attention (harmonic coherence — scoring CPU, out_proj GPU) ───
+        let attn_out = harmonic_attention_gpu(&block.attn, &normed, n_bands, n_head, head_dim, gpu);
+
+        // ─── FFN (dual-maestro Kerr-ODE — ODE CPU, out_proj GPU) ───
+        let ffn_out: Vec<Vec<f32>> = normed.iter()
+            .map(|x| dual_maestro_ffn_gpu(&block.ffn, x, gpu))
+            .collect();
+
+        // Parallel residual
+        hidden = (0..t).map(|i| {
+            let mut v = vec![0.0f32; n_embd];
+            for j in 0..n_embd { v[j] = hidden[i][j] + attn_out[i][j] + ffn_out[i][j]; }
+            v
+        }).collect();
     }
 
-    h
+    // Final LN (CPU) + LM head (GPU — vocab×n_embd, biggest matmul)
+    hidden.iter().map(|h| {
+        let normed = layer_norm_cpu(h, &model.ln_f.weight, &model.ln_f.bias);
+        gpu.linear_no_bias(&model.lm_head, &normed)
+    }).collect()
 }
 
-/// Attention with GPU-accelerated Q/K/V and output projections.
-fn attention_gpu(
-    model: &ModelWeights,
-    weights: &AttentionWeights,
+/// Harmonic coherence attention with GPU out_proj.
+/// Phase scoring is CPU (frozen, O(T²×n_heads) of scalar ops).
+/// Out_proj is GPU (768×768 matmul per position).
+fn harmonic_attention_gpu(
+    weights: &WaveAttnWeights,
     x: &[Vec<f32>],
+    n_bands: usize,
+    n_head: usize,
+    head_dim: usize,
     gpu: &mut GpuAccelerator,
 ) -> Vec<Vec<f32>> {
     let t = x.len();
-    let n_embd = model.config.n_embd();
-    let n_head = weights.n_head;
-    let head_dim = n_embd / n_head;
-
-    // Q/K/V projection via GPU
-    let mut q_all = vec![vec![0.0f32; n_embd]; t];
-    let mut k_all = vec![vec![0.0f32; n_embd]; t];
-    let mut v_all = vec![vec![0.0f32; n_embd]; t];
-
-    for pos in 0..t {
-        let qkv = gpu.linear(&weights.c_attn.w, &weights.c_attn.b, &x[pos]);
-        for i in 0..n_embd {
-            q_all[pos][i] = qkv[i];
-            k_all[pos][i] = qkv[n_embd + i];
-            v_all[pos][i] = qkv[2 * n_embd + i];
-        }
-    }
-
-    // Attention scores + softmax (CPU — memory-bound, not compute-bound)
-    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n_embd = n_bands * 2;
     let mut out = vec![vec![0.0f32; n_embd]; t];
 
     for head in 0..n_head {
+        let harmonic_n = softplus_cpu(weights.heads[head].harmonic_raw);
         let offset = head * head_dim;
-        for qi in 0..t {
-            let mut att = vec![f32::NEG_INFINITY; t];
-            for ki in 0..=qi {
-                let mut dot = 0.0f32;
-                for d in 0..head_dim {
-                    dot += q_all[qi][offset + d] * k_all[ki][offset + d];
-                }
-                att[ki] = dot * scale;
-            }
 
-            let max_att = att[..=qi].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        // Phase projection (CPU — 2-element output per position)
+        let phases: Vec<f32> = (0..t).map(|pos| {
+            project_phase_cpu(&x[pos], &weights.heads[head].phase_proj_w, &weights.heads[head].phase_proj_b)
+        }).collect();
+
+        // Value projection (CPU — small per-head matmul)
+        let v_all: Vec<Vec<f32>> = (0..t).map(|pos| {
+            let mut v = vec![0.0f32; head_dim];
+            for d in 0..head_dim {
+                let mut sum = 0.0f32;
+                for j in 0..head_dim {
+                    sum += weights.heads[head].v_proj_w[d][j] * x[pos][offset + j];
+                }
+                v[d] = sum + weights.heads[head].v_proj_b[d];
+            }
+            v
+        }).collect();
+
+        // Phase-hashed sparse attention (CPU — scalar ops)
+        const N_BUCKETS: usize = 8;
+        let bucket_width = std::f32::consts::TAU / N_BUCKETS as f32;
+        let buckets: Vec<usize> = phases.iter().map(|&p| {
+            let n = ((p % std::f32::consts::TAU) + std::f32::consts::TAU) % std::f32::consts::TAU;
+            ((n / bucket_width) as usize).min(N_BUCKETS - 1)
+        }).collect();
+
+        let mut bucket_positions: Vec<Vec<usize>> = vec![Vec::new(); N_BUCKETS];
+        for (pos, &b) in buckets.iter().enumerate() { bucket_positions[b].push(pos); }
+
+        for qi in 0..t {
+            let qi_bucket = buckets[qi];
+            let mut scores = vec![f32::NEG_INFINITY; t];
+
+            for db in 0..=2 {
+                let tb = if db == 0 { (qi_bucket + N_BUCKETS - 1) % N_BUCKETS }
+                         else if db == 1 { qi_bucket }
+                         else { (qi_bucket + 1) % N_BUCKETS };
+                for &ki in &bucket_positions[tb] {
+                    if ki > qi { continue; }
+                    scores[ki] = (harmonic_n * (phases[qi] - phases[ki])).cos();
+                }
+            }
+            if qi > 0 && scores[qi - 1] == f32::NEG_INFINITY {
+                scores[qi - 1] = (harmonic_n * (phases[qi] - phases[qi - 1])).cos();
+            }
+            if scores[qi] == f32::NEG_INFINITY { scores[qi] = 1.0; }
+
+            let max_s = scores[..=qi].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut exp_sum = 0.0f32;
             for ki in 0..=qi {
-                att[ki] = (att[ki] - max_att).exp();
-                exp_sum += att[ki];
+                if scores[ki] > f32::NEG_INFINITY { scores[ki] = (scores[ki] - max_s).exp(); exp_sum += scores[ki]; }
+                else { scores[ki] = 0.0; }
             }
-            for ki in 0..=qi { att[ki] /= exp_sum; }
+            if exp_sum > 0.0 { for ki in 0..=qi { scores[ki] /= exp_sum; } }
 
             for d in 0..head_dim {
-                let mut val = 0.0f32;
-                for ki in 0..=qi {
-                    val += att[ki] * v_all[ki][offset + d];
-                }
-                out[qi][offset + d] = val;
+                let mut sum = 0.0f32;
+                for ki in 0..=qi { if scores[ki] > 0.0 { sum += scores[ki] * v_all[ki][d]; } }
+                out[qi][offset + d] = sum;
             }
         }
     }
 
-    // Output projection via GPU
-    let mut result = Vec::with_capacity(t);
-    for pos in 0..t {
-        result.push(gpu.linear(&weights.c_proj.w, &weights.c_proj.b, &out[pos]));
-    }
-    result
+    // Output projection — GPU (768×768 per position)
+    out.iter().map(|o| gpu.linear(&weights.out_proj_w, &weights.out_proj_b, o)).collect()
 }
 
-/// PerBandLinear with GPU output projection.
-fn per_band_gpu(
-    weights: &PerBandLinearWeights,
-    x: &[Vec<f32>],
+/// Dual-maestro Kerr-ODE FFN with GPU out_proj.
+fn dual_maestro_ffn_gpu(
+    weights: &KerrDualMaestroWeights,
+    x: &[f32],
     gpu: &mut GpuAccelerator,
-) -> Vec<Vec<f32>> {
-    let t = x.len();
-    let n_bands = weights.band_w.len();
+) -> Vec<f32> {
+    let n_embd = x.len();
+
+    // Maestro in (GPU for projections — dim=16 is small but consistent routing)
+    let sq_in = gpu.linear(&weights.maestro_in.squeeze.w, &weights.maestro_in.squeeze.b, x);
+    let act_in: Vec<f32> = sq_in.iter().map(|&v| gelu_cpu(v)).collect();
+    let mae_in = gpu.linear(&weights.maestro_in.process_1.w, &weights.maestro_in.process_1.b, &act_in);
+
+    let mut precond = vec![0.0f32; n_embd];
+    for i in 0..n_embd { precond[i] = x[i] + mae_in[i]; }
+
+    // Kerr ODE (CPU — sequential RK4)
+    let kerr_out = kerr_ode_forward_cpu(&weights.kerr, &precond);
+
+    // Maestro out
+    let sq_out = gpu.linear(&weights.maestro_out.squeeze.w, &weights.maestro_out.squeeze.b, &kerr_out);
+    let act_out: Vec<f32> = sq_out.iter().map(|&v| gelu_cpu(v)).collect();
+    let mae_out = gpu.linear(&weights.maestro_out.process_1.w, &weights.maestro_out.process_1.b, &act_out);
+
+    let mut regulated = vec![0.0f32; n_embd];
+    for i in 0..n_embd { regulated[i] = kerr_out[i] + mae_out[i]; }
+
+    // Out projection — GPU (768×768)
+    gpu.linear(&weights.out_proj.w, &weights.out_proj.b, &regulated)
+}
+
+/// Kerr ODE forward (CPU — sequential RK4 integration).
+fn kerr_ode_forward_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
+    let n_bands = weights.gamma_raw.len();
     let n_embd = n_bands * 2;
-    let mut result = Vec::with_capacity(t);
+    let dt = 1.0 / weights.rk4_n_steps as f32;
 
-    for pos in 0..t {
-        let mut bands_out = vec![0.0f32; n_embd];
-        for band in 0..n_bands {
-            let r_in = x[pos][band * 2];
-            let s_in = x[pos][band * 2 + 1];
-            let w = &weights.band_w[band];
-            let b = &weights.band_b[band];
-            bands_out[band * 2] = w[0][0] * r_in + w[1][0] * s_in + b[0];
-            bands_out[band * 2 + 1] = w[0][1] * r_in + w[1][1] * s_in + b[1];
+    let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus_cpu(g)).collect();
+    let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
+    let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
+
+    for _ in 0..weights.rk4_n_steps {
+        let (k1r, k1s) = kerr_deriv(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta);
+        let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&a,&b)| a+0.5*dt*b).collect();
+        let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&a,&b)| a+0.5*dt*b).collect();
+        let (k2r, k2s) = kerr_deriv(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta);
+        let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&a,&b)| a+0.5*dt*b).collect();
+        let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&a,&b)| a+0.5*dt*b).collect();
+        let (k3r, k3s) = kerr_deriv(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta);
+        let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a,&b)| a+dt*b).collect();
+        let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a,&b)| a+dt*b).collect();
+        let (k4r, k4s) = kerr_deriv(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
+        for i in 0..n_bands {
+            r[i] += dt/6.0 * (k1r[i] + 2.0*k2r[i] + 2.0*k3r[i] + k4r[i]);
+            s[i] += dt/6.0 * (k1s[i] + 2.0*k2s[i] + 2.0*k3s[i] + k4s[i]);
         }
-        result.push(gpu.linear(&weights.out_proj.w, &weights.out_proj.b, &bands_out));
     }
-    result
+
+    let mut out = vec![0.0f32; n_embd];
+    for k in 0..n_bands { out[k * 2] = r[k]; out[k * 2 + 1] = s[k]; }
+    out
 }
 
-/// Kerr-ODE + Maestro with memory injection (ODE on CPU, projections on GPU).
-fn kerr_maestro_gpu(
-    model: &ModelWeights,
-    weights: &KerrMaestroAddWeights,
-    x: &[Vec<f32>],
-    memory: Option<(&[f32], &[f32])>,
-    gpu: &mut GpuAccelerator,
-) -> Vec<Vec<f32>> {
-    let t = x.len();
-    let mut result = Vec::with_capacity(t);
-
-    for pos in 0..t {
-        // Kerr path (CPU — ODE integration + memory injection)
-        let kerr_out = model.kerr_ode_forward_with_memory(&weights.kerr, &x[pos], memory);
-
-        // Maestro path (GPU for projections)
-        let squeezed = gpu.linear(&weights.maestro.squeeze.w, &weights.maestro.squeeze.b, &x[pos]);
-        let activated: Vec<f32> = squeezed.iter().map(|&v| gelu(v)).collect();
-        let maestro_out = gpu.linear(&weights.maestro.process_1.w, &weights.maestro.process_1.b, &activated);
-
-        // Combine + project (GPU)
-        let n_embd = kerr_out.len();
-        let mut combined = vec![0.0f32; n_embd];
-        for i in 0..n_embd { combined[i] = kerr_out[i] + maestro_out[i]; }
-
-        result.push(gpu.linear(&weights.out_proj.w, &weights.out_proj.b, &combined));
+fn kerr_deriv(r: &[f32], s: &[f32], gamma: &[f32], omega: &[f32], alpha: f32, beta: f32) -> (Vec<f32>, Vec<f32>) {
+    let n = r.len();
+    let mut dr = vec![0.0f32; n];
+    let mut ds = vec![0.0f32; n];
+    for k in 0..n {
+        let mag_sq = r[k]*r[k] + s[k]*s[k];
+        let mut ns = 0.0f32;
+        if k >= 2 { ns += r[k-2]*r[k-2] + s[k-2]*s[k-2]; }
+        if k >= 1 { ns += r[k-1]*r[k-1] + s[k-1]*s[k-1]; }
+        if k+1 < n { ns += r[k+1]*r[k+1] + s[k+1]*s[k+1]; }
+        if k+2 < n { ns += r[k+2]*r[k+2] + s[k+2]*s[k+2]; }
+        let phi = omega[k] + alpha * mag_sq + beta * ns;
+        dr[k] = -gamma[k] * r[k] - phi * s[k];
+        ds[k] = -gamma[k] * s[k] + phi * r[k];
     }
-    result
+    (dr, ds)
 }
 
-/// CPU layer norm (not worth GPU dispatch overhead for single vectors).
 fn layer_norm_cpu(x: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
     let n = x.len();
     let mean: f32 = x.iter().sum::<f32>() / n as f32;
@@ -223,8 +236,12 @@ fn layer_norm_cpu(x: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// GELU activation (CPU).
-fn gelu(x: f32) -> f32 {
-    let cdf = 0.5 * (1.0 + ((2.0 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x * x * x)).tanh());
-    x * cdf
+fn project_phase_cpu(x: &[f32], proj_w: &[Vec<f32>], proj_b: &[f32]) -> f32 {
+    let mut r = proj_b[0];
+    let mut s = proj_b[1];
+    for j in 0..x.len() { r += proj_w[0][j] * x[j]; s += proj_w[1][j] * x[j]; }
+    s.atan2(r)
 }
+
+fn softplus_cpu(x: f32) -> f32 { if x > 20.0 { x } else { (1.0 + x.exp()).ln() } }
+fn gelu_cpu(x: f32) -> f32 { 0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x * x * x)).tanh()) }

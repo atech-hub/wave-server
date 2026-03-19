@@ -192,7 +192,7 @@ fn main() {
 }
 
 fn print_help() {
-    println!("wave-server v0.3.0 — OpenAI-compatible API for wave-engine models");
+    println!("wave-server v0.1.0 — OpenAI-compatible API for wave-engine models");
     println!();
     println!("USAGE:");
     println!("    wave-server <CHECKPOINT> [DATA] [OPTIONS]");
@@ -218,6 +218,9 @@ fn print_help() {
     println!("                    into Kerr-ODE initial conditions. Accumulates experience");
     println!("                    across conversations. Auto-saves after each request.");
     println!("                    Creates fresh file if it doesn't exist. [default: none]");
+    println!("    --gpu           Enable GPU acceleration for matmul operations.");
+    println!("                    Requires compilation with --features gpu.");
+    println!("                    Uses wgpu (Vulkan/Metal/DX12).          [default: off]");
     println!();
     println!("TOKENIZER:");
     println!("    --word          Word-level tokenization. Must match the mode used during");
@@ -234,12 +237,12 @@ fn print_help() {
     println!("    architecture in the header. v2 checkpoints (saved by wave-engine v0.2+)");
     println!("    auto-detect all of these.");
     println!();
-    println!("    --n-bands N     Harmonic frequency bands              [default: 64]");
-    println!("    --n-head N      Attention heads                       [default: 4]");
-    println!("    --n-layers N    Transformer blocks                    [default: 4]");
+    println!("    --n-bands N     Harmonic frequency bands              [default: 384]");
+    println!("    --n-head N      Attention heads                       [default: 12]");
+    println!("    --n-layers N    Transformer blocks                    [default: 24]");
     println!("    --maestro-dim N Maestro bottleneck width               [default: 16]");
     println!("    --block-size N  Max sequence length                    [default: 256]");
-    println!("    --rk4-steps N   ODE integration steps per layer        [default: 8]");
+    println!("    --rk4-steps N   ODE integration steps per layer        [default: 16]");
     println!();
     println!("ENDPOINTS:");
     println!("    POST /v1/chat/completions    Chat completions (JSON or SSE streaming)");

@@ -14,6 +14,20 @@ use crate::inference::{self, GenerationConfig, MemoryOffsets};
 use crate::prompt;
 use crate::server::AppState;
 
+/// Log request telemetry to requests.jsonl (survives crashes, enables replay)
+fn log_request(prompt_tokens: usize, gen_tokens: usize, time_ms: u128,
+               temperature: f32, top_p: f32, text: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("requests.jsonl") {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap().as_secs();
+        let tps = if time_ms > 0 { gen_tokens as f64 / time_ms as f64 * 1000.0 } else { 0.0 };
+        let preview: String = text.chars().take(100).collect();
+        let preview = preview.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+        let _ = writeln!(f, "{{\"ts\":{ts},\"prompt_tok\":{prompt_tokens},\"gen_tok\":{gen_tokens},\"ms\":{time_ms},\"tok_s\":{tps:.1},\"temp\":{temperature},\"top_p\":{top_p},\"text\":\"{preview}\"}}");
+    }
+}
+
 /// POST /v1/chat/completions
 pub async fn handle_chat_completion(
     State(state): State<Arc<AppState>>,
@@ -63,10 +77,14 @@ pub async fn handle_chat_completion(
         .unwrap()
         .as_secs();
 
+    let temp = req.temperature;
+    let top_p = req.top_p;
+    let prompt_len = prompt_tokens.len();
+
     if req.stream {
-        Ok(handle_streaming(state, prompt_tokens, config, model_name, request_id, created).await)
+        Ok(handle_streaming(state, prompt_tokens, config, model_name, request_id, created, prompt_len, temp, top_p).await)
     } else {
-        Ok(handle_non_streaming(state, prompt_tokens, config, model_name, request_id, created).await)
+        Ok(handle_non_streaming(state, prompt_tokens, config, model_name, request_id, created, prompt_len, temp, top_p).await)
     }
 }
 
@@ -128,8 +146,11 @@ async fn handle_non_streaming(
     model_name: String,
     request_id: String,
     created: u64,
+    prompt_len: usize,
+    temperature: f32,
+    top_p: f32,
 ) -> Response {
-    let prompt_len = prompt_tokens.len();
+    let gen_start = std::time::Instant::now();
     let model = state.model.clone();
     let vocab = state.vocab.clone();
     let mem_offsets = get_memory_offsets(&state);
@@ -157,6 +178,10 @@ async fn handle_non_streaming(
     })
     .await
     .unwrap();
+
+    // Telemetry
+    log_request(prompt_len, result.tokens.len(), gen_start.elapsed().as_millis(),
+                temperature, top_p, &result.text);
 
     // Update memory with full conversation (prompt + generated)
     let mem_offsets_for_update = get_memory_offsets(&state);
@@ -194,7 +219,11 @@ async fn handle_streaming(
     model_name: String,
     request_id: String,
     created: u64,
+    prompt_len: usize,
+    temperature: f32,
+    top_p: f32,
 ) -> Response {
+    let gen_start = std::time::Instant::now();
     let model = state.model.clone();
     let vocab = state.vocab.clone();
 

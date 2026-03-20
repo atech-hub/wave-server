@@ -249,6 +249,11 @@ fn print_help() {
     println!("    GET  /v1/models              List available models");
     println!("    GET  /health                 Health check (no auth required)");
     println!();
+    println!("TELEMETRY:");
+    println!("    requests.jsonl  Written automatically for every chat completion request.");
+    println!("                    Logs: timestamp, prompt/gen tokens, ms, tokens/sec,");
+    println!("                    temperature, top_p, text preview. Survives crashes.");
+    println!();
     println!("EXAMPLES:");
     println!("    # Serve a char-level Shakespeare model");
     println!("    wave-server checkpoint_final.bin data/input.txt");

@@ -177,34 +177,37 @@ fn dual_maestro_ffn_gpu(
 }
 
 /// Kerr ODE forward (CPU — sequential RK4 integration).
+/// Perturbative ODE — matches wave-engine and model.rs implementations.
 fn kerr_ode_forward_cpu(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
     let n_bands = weights.gamma_raw.len();
     let n_embd = n_bands * 2;
-    let dt = 1.0 / weights.rk4_n_steps as f32;
 
     let gamma: Vec<f32> = weights.gamma_raw.iter().map(|&g| softplus_cpu(g)).collect();
-    let mut r: Vec<f32> = (0..n_bands).map(|k| x[k * 2]).collect();
-    let mut s: Vec<f32> = (0..n_bands).map(|k| x[k * 2 + 1]).collect();
 
-    for _ in 0..weights.rk4_n_steps {
-        let (k1r, k1s) = kerr_deriv(&r, &s, &gamma, &weights.omega, weights.alpha, weights.beta);
-        let r2: Vec<f32> = r.iter().zip(&k1r).map(|(&a,&b)| a+0.5*dt*b).collect();
-        let s2: Vec<f32> = s.iter().zip(&k1s).map(|(&a,&b)| a+0.5*dt*b).collect();
-        let (k2r, k2s) = kerr_deriv(&r2, &s2, &gamma, &weights.omega, weights.alpha, weights.beta);
-        let r3: Vec<f32> = r.iter().zip(&k2r).map(|(&a,&b)| a+0.5*dt*b).collect();
-        let s3: Vec<f32> = s.iter().zip(&k2s).map(|(&a,&b)| a+0.5*dt*b).collect();
-        let (k3r, k3s) = kerr_deriv(&r3, &s3, &gamma, &weights.omega, weights.alpha, weights.beta);
-        let r4: Vec<f32> = r.iter().zip(&k3r).map(|(&a,&b)| a+dt*b).collect();
-        let s4: Vec<f32> = s.iter().zip(&k3s).map(|(&a,&b)| a+dt*b).collect();
-        let (k4r, k4s) = kerr_deriv(&r4, &s4, &gamma, &weights.omega, weights.alpha, weights.beta);
-        for i in 0..n_bands {
-            r[i] += dt/6.0 * (k1r[i] + 2.0*k2r[i] + 2.0*k3r[i] + k4r[i]);
-            s[i] += dt/6.0 * (k1s[i] + 2.0*k2s[i] + 2.0*k3s[i] + k4s[i]);
-        }
+    let mut r_lin = vec![0.0f32; n_bands];
+    let mut s_lin = vec![0.0f32; n_bands];
+    for k in 0..n_bands {
+        let r = x[k * 2];
+        let s = x[k * 2 + 1];
+        let decay = (-gamma[k]).exp();
+        let cos_w = weights.omega[k].cos();
+        let sin_w = weights.omega[k].sin();
+        r_lin[k] = decay * (r * cos_w - s * sin_w);
+        s_lin[k] = decay * (r * sin_w + s * cos_w);
     }
 
     let mut out = vec![0.0f32; n_embd];
-    for k in 0..n_bands { out[k * 2] = r[k]; out[k * 2 + 1] = s[k]; }
+    for k in 0..n_bands {
+        let mag_sq = r_lin[k] * r_lin[k] + s_lin[k] * s_lin[k];
+        let mut ns = 0.0f32;
+        if k >= 2 { ns += r_lin[k-2]*r_lin[k-2] + s_lin[k-2]*s_lin[k-2]; }
+        if k >= 1 { ns += r_lin[k-1]*r_lin[k-1] + s_lin[k-1]*s_lin[k-1]; }
+        if k+1 < n_bands { ns += r_lin[k+1]*r_lin[k+1] + s_lin[k+1]*s_lin[k+1]; }
+        if k+2 < n_bands { ns += r_lin[k+2]*r_lin[k+2] + s_lin[k+2]*s_lin[k+2]; }
+        let delta_phi = weights.alpha * mag_sq + weights.beta * ns;
+        out[k * 2]     = r_lin[k] - delta_phi * s_lin[k];
+        out[k * 2 + 1] = s_lin[k] + delta_phi * r_lin[k];
+    }
     out
 }
 

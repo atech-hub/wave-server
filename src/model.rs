@@ -73,12 +73,20 @@ pub struct MaestroWeights {
     pub process_1: LinearWeights,
 }
 
+/// Block-diagonal linear — groups of bands processed independently.
+#[derive(Clone)]
+pub struct BlockDiagonalWeights {
+    pub groups: Vec<LinearWeights>,  // n_groups × (group_size, group_size)
+    pub n_groups: usize,
+    pub group_size: usize,
+}
+
 #[derive(Clone)]
 pub struct KerrDualMaestroWeights {
     pub kerr: KerrWeights,
     pub maestro_in: MaestroWeights,
     pub maestro_out: MaestroWeights,
-    pub out_proj: LinearWeights,
+    pub out_proj: BlockDiagonalWeights,
 }
 
 /// Weights for one harmonic coherence attention head.
@@ -187,6 +195,23 @@ pub fn layer_norm(x: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
     let var: f32 = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
     let std = (var + 1e-5).sqrt();
     (0..n).map(|i| (x[i] - mean) / std * weight[i] + bias[i]).collect()
+}
+
+fn block_diagonal_forward(weights: &BlockDiagonalWeights, x: &[f32]) -> Vec<f32> {
+    let n_embd = weights.n_groups * weights.group_size;
+    let mut out = vec![0.0f32; n_embd];
+    for g in 0..weights.n_groups {
+        let start = g * weights.group_size;
+        let gw = &weights.groups[g];
+        for i in 0..weights.group_size {
+            let mut sum = gw.b[i];
+            for j in 0..weights.group_size {
+                sum += gw.w[i][j] * x[start + j];
+            }
+            out[start + i] = sum;
+        }
+    }
+    out
 }
 
 fn gelu(x: f32) -> f32 {
@@ -450,7 +475,7 @@ fn dual_maestro_ffn_forward_with_memory(
     for i in 0..n_embd { regulated[i] = kerr_out[i] + mae_out[i]; }
 
     // Out projection
-    linear(&weights.out_proj.w, &weights.out_proj.b, &regulated)
+    block_diagonal_forward(&weights.out_proj, &regulated)
 }
 
 /// FFN forward that also returns ODE output for memory state extraction (Fix 2).
@@ -478,7 +503,7 @@ fn dual_maestro_ffn_forward_extract(
     let mut regulated = vec![0.0f32; n_embd];
     for i in 0..n_embd { regulated[i] = kerr_out[i] + mae_out[i]; }
 
-    let ffn_out = linear(&weights.out_proj.w, &weights.out_proj.b, &regulated);
+    let ffn_out = block_diagonal_forward(&weights.out_proj, &regulated);
     (ffn_out, kerr_out) // return ODE OUTPUT for memory extraction
 }
 

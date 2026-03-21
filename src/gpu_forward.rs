@@ -173,7 +173,8 @@ fn dual_maestro_ffn_gpu(
     for i in 0..n_embd { regulated[i] = kerr_out[i] + mae_out[i]; }
 
     // Out projection — GPU (768×768)
-    gpu.linear(&weights.out_proj.w, &weights.out_proj.b, &regulated)
+    // Block-diagonal out_proj (CPU — GPU dispatch for small groups is slower)
+    crate::model::block_diagonal_forward(&weights.out_proj, &regulated)
 }
 
 /// Kerr ODE forward (CPU — sequential RK4 integration).

@@ -132,7 +132,7 @@ fn count_trainable_params(config: &ModelConfig, vocab_size: usize) -> usize {
         n_embd * md + n_embd +    // mae_in process
         md * n_embd + md +        // mae_out squeeze
         n_embd * md + n_embd +    // mae_out process
-        n_embd * n_embd + n_embd; // out_proj
+        6 * ((n_embd/6) * (n_embd/6) + (n_embd/6)); // block-diagonal out_proj (6 groups)
 
     config.n_layers * per_block + n_embd * 2 + vocab_size * n_embd
 }
@@ -167,7 +167,15 @@ fn create_empty_model(config: &ModelConfig, vocab_size: usize) -> ModelWeights {
                 },
                 maestro_in: MaestroWeights { squeeze: make_linear(md, n_embd), process_1: make_linear(n_embd, md) },
                 maestro_out: MaestroWeights { squeeze: make_linear(md, n_embd), process_1: make_linear(n_embd, md) },
-                out_proj: make_linear(n_embd, n_embd),
+                out_proj: {
+                    let n_groups = 6; // matches wave-engine's 6-group config
+                    let group_size = n_embd / n_groups;
+                    BlockDiagonalWeights {
+                        groups: (0..n_groups).map(|_| make_linear(group_size, group_size)).collect(),
+                        n_groups,
+                        group_size,
+                    }
+                },
             },
         }
     }).collect();
@@ -201,8 +209,12 @@ fn unflatten_to_model(config: &ModelConfig, vocab_size: usize, params: &[f32]) -
         block.ffn.maestro_out.squeeze.b.copy_from_slice(&params[idx..idx+md]); idx += md;
         for row in &mut block.ffn.maestro_out.process_1.w { row.copy_from_slice(&params[idx..idx+md]); idx += md; }
         block.ffn.maestro_out.process_1.b.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-        for row in &mut block.ffn.out_proj.w { row.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd; }
-        block.ffn.out_proj.b.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
+        // Block-diagonal out_proj: 6 groups × (group_size×group_size weight + group_size bias)
+        let gs = n_embd / 6;
+        for g in &mut block.ffn.out_proj.groups {
+            for row in &mut g.w { row.copy_from_slice(&params[idx..idx+gs]); idx += gs; }
+            g.b.copy_from_slice(&params[idx..idx+gs]); idx += gs;
+        }
     }
 
     model.ln_f.weight.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;

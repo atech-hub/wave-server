@@ -35,7 +35,7 @@ pub struct MemoryOffsets {
     pub offsets: Vec<(Vec<f32>, Vec<f32>)>, // [(r_offset, s_offset)] per ODE layer
 }
 
-/// Generate all tokens at once (non-streaming) with KV-cache.
+/// Generate all tokens at once (non-streaming) with KV-cache + memory injection.
 pub fn generate(
     model: &ModelWeights,
     prompt_tokens: &[usize],
@@ -43,14 +43,19 @@ pub fn generate(
     vocab: &Vocab,
     memory: Option<&MemoryOffsets>,
 ) -> GenerationResult {
-    let _ = memory; // TODO: wire memory into cached forward
     let mut rng = make_rng();
     let mut tokens = prompt_tokens.to_vec();
     let mut generated = Vec::new();
 
-    // Prefill: process entire prompt, populate KV-cache
+    // Build offset slices for memory injection
+    let offset_slices: Option<Vec<(&[f32], &[f32])>> = memory.map(|m|
+        m.offsets.iter().map(|(r, s)| (r.as_slice(), s.as_slice())).collect()
+    );
+    let mem_arg = offset_slices.as_deref();
+
+    // Prefill: process entire prompt, populate KV-cache (with memory injection)
     let mut cache = KvCache::new(&model.config);
-    let mut logits = model.prefill(prompt_tokens, &mut cache);
+    let mut logits = model.prefill(prompt_tokens, &mut cache, mem_arg);
 
     for _ in 0..config.max_tokens {
         if let Some(penalty) = config.repetition_penalty {
@@ -63,9 +68,9 @@ pub fn generate(
         tokens.push(token);
         generated.push(token);
 
-        // Decode next: O(1) per layer using KV-cache
+        // Decode next: O(1) per layer using KV-cache (with memory injection)
         let pos = tokens.len() - 1;
-        logits = model.forward_one_cached(token, pos, &mut cache);
+        logits = model.forward_one_cached(token, pos, &mut cache, mem_arg);
     }
 
     let text = vocab.decode(&generated);
@@ -128,13 +133,18 @@ pub fn generate_streaming<F>(
 ) where
     F: FnMut(TokenEvent) -> bool,
 {
-    let _ = memory; // TODO: wire memory into cached forward
     let mut rng = make_rng();
     let mut tokens = prompt_tokens.to_vec();
 
-    // Prefill: process entire prompt, populate KV-cache
+    // Build offset slices for memory injection
+    let offset_slices: Option<Vec<(&[f32], &[f32])>> = memory.map(|m|
+        m.offsets.iter().map(|(r, s)| (r.as_slice(), s.as_slice())).collect()
+    );
+    let mem_arg = offset_slices.as_deref();
+
+    // Prefill: process entire prompt, populate KV-cache (with memory injection)
     let mut cache = KvCache::new(&model.config);
-    let mut logits = model.prefill(prompt_tokens, &mut cache);
+    let mut logits = model.prefill(prompt_tokens, &mut cache, mem_arg);
 
     for i in 0..config.max_tokens {
         if let Some(penalty) = config.repetition_penalty {
@@ -153,9 +163,9 @@ pub fn generate_streaming<F>(
             break;
         }
 
-        // Next token: O(1) per layer using KV-cache
+        // Next token: O(1) per layer using KV-cache (with memory injection)
         let pos = tokens.len() - 1;
-        logits = model.forward_one_cached(token, pos, &mut cache);
+        logits = model.forward_one_cached(token, pos, &mut cache, mem_arg);
     }
 }
 

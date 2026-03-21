@@ -410,12 +410,32 @@ fn kerr_ode_forward(weights: &KerrWeights, x: &[f32]) -> Vec<f32> {
 }
 
 fn dual_maestro_ffn_forward(weights: &KerrDualMaestroWeights, x: &[f32]) -> Vec<f32> {
+    dual_maestro_ffn_forward_with_memory(weights, x, None)
+}
+
+/// FFN forward with optional memory injection into ODE initial conditions.
+/// Returns the FFN output. If you also need the ODE output for memory extraction,
+/// use dual_maestro_ffn_forward_extract() instead.
+fn dual_maestro_ffn_forward_with_memory(
+    weights: &KerrDualMaestroWeights,
+    x: &[f32],
+    memory_offset: Option<(&[f32], &[f32])>, // (r_offset, s_offset) per band
+) -> Vec<f32> {
     let n_embd = x.len();
+    let n_bands = n_embd / 2;
 
     // Maestro in (pre-ODE regulator)
     let mae_in = maestro_forward(&weights.maestro_in, x);
     let mut precond = vec![0.0f32; n_embd];
     for i in 0..n_embd { precond[i] = x[i] + mae_in[i]; }
+
+    // Memory injection: add offsets to ODE initial conditions
+    if let Some((r_off, s_off)) = memory_offset {
+        for k in 0..n_bands {
+            precond[k * 2] += r_off[k];
+            precond[k * 2 + 1] += s_off[k];
+        }
+    }
 
     // Kerr ODE
     let kerr_out = kerr_ode_forward(&weights.kerr, &precond);
@@ -427,6 +447,35 @@ fn dual_maestro_ffn_forward(weights: &KerrDualMaestroWeights, x: &[f32]) -> Vec<
 
     // Out projection
     linear(&weights.out_proj.w, &weights.out_proj.b, &regulated)
+}
+
+/// FFN forward that also returns ODE output for memory state extraction (Fix 2).
+fn dual_maestro_ffn_forward_extract(
+    weights: &KerrDualMaestroWeights,
+    x: &[f32],
+    memory_offset: Option<(&[f32], &[f32])>,
+) -> (Vec<f32>, Vec<f32>) {
+    let n_embd = x.len();
+    let n_bands = n_embd / 2;
+
+    let mae_in = maestro_forward(&weights.maestro_in, x);
+    let mut precond = vec![0.0f32; n_embd];
+    for i in 0..n_embd { precond[i] = x[i] + mae_in[i]; }
+
+    if let Some((r_off, s_off)) = memory_offset {
+        for k in 0..n_bands {
+            precond[k * 2] += r_off[k];
+            precond[k * 2 + 1] += s_off[k];
+        }
+    }
+
+    let kerr_out = kerr_ode_forward(&weights.kerr, &precond);
+    let mae_out = maestro_forward(&weights.maestro_out, &kerr_out);
+    let mut regulated = vec![0.0f32; n_embd];
+    for i in 0..n_embd { regulated[i] = kerr_out[i] + mae_out[i]; }
+
+    let ffn_out = linear(&weights.out_proj.w, &weights.out_proj.b, &regulated);
+    (ffn_out, kerr_out) // return ODE OUTPUT for memory extraction
 }
 
 // ─── Full forward pass ──────────────────────────────────────
@@ -491,17 +540,61 @@ impl ModelWeights {
     }
 
     /// Forward with wave memory injection (offsets added to ODE initial conditions).
+    /// memory_offsets: one (r_offset, s_offset) per ODE layer.
     pub fn forward_with_memory(
         &self,
         tokens: &[usize],
         memory_offsets: Option<&[(&[f32], &[f32])]>,
     ) -> Vec<Vec<f32>> {
-        let _ = memory_offsets;
-        self.forward(tokens)
+        let t = tokens.len();
+        let n_embd = self.config.n_embd();
+        let n_bands = self.config.n_bands;
+
+        let mut hidden: Vec<Vec<f32>> = tokens.iter().enumerate().map(|(pos, &tok)| {
+            let mut h = vec![0.0f32; n_embd];
+            let tok_idx = tok.min(self.vocab_size - 1);
+            let pos_idx = pos.min(self.config.block_size - 1);
+            for i in 0..n_embd { h[i] = self.wte[tok_idx][i] + self.wpe[pos_idx][i]; }
+            h
+        }).collect();
+
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            let normed: Vec<Vec<f32>> = hidden.iter()
+                .map(|h| layer_norm(h, &block.ln.weight, &block.ln.bias))
+                .collect();
+
+            let attn_out = wave_attention_forward(&block.attn, &normed, n_bands);
+
+            // Get memory offset for this layer (if available)
+            let mem = memory_offsets.and_then(|m| m.get(layer_idx).copied());
+
+            let ffn_out: Vec<Vec<f32>> = normed.iter()
+                .map(|x| dual_maestro_ffn_forward_with_memory(&block.ffn, x, mem))
+                .collect();
+
+            hidden = (0..t).map(|i| {
+                let mut v = vec![0.0f32; n_embd];
+                for j in 0..n_embd { v[j] = hidden[i][j] + attn_out[i][j] + ffn_out[i][j]; }
+                v
+            }).collect();
+        }
+
+        let post_ln: Vec<Vec<f32>> = hidden.iter()
+            .map(|h| layer_norm(h, &self.ln_f.weight, &self.ln_f.bias))
+            .collect();
+
+        post_ln.iter().map(|h| {
+            let mut logits = vec![0.0f32; self.vocab_size];
+            for v in 0..self.vocab_size {
+                for j in 0..n_embd { logits[v] += self.lm_head[v][j] * h[j]; }
+            }
+            logits
+        }).collect()
     }
 
     /// Prefill the KV-cache with prompt tokens (full forward, caches all positions).
-    pub fn prefill(&self, tokens: &[usize], cache: &mut KvCache) -> Vec<f32> {
+    /// memory_offsets: one (r_offset, s_offset) per ODE layer, or None.
+    pub fn prefill(&self, tokens: &[usize], cache: &mut KvCache, memory_offsets: Option<&[(&[f32], &[f32])]>) -> Vec<f32> {
         cache.clear();
         let t = tokens.len();
         let n_embd = self.config.n_embd();
@@ -551,9 +644,10 @@ impl ModelWeights {
             // Full attention for all positions (same as uncached)
             let attn_out = wave_attention_forward(&block.attn, &normed, n_bands);
 
-            // FFN for all positions
+            // FFN for all positions (with memory injection if available)
+            let mem = memory_offsets.and_then(|m| m.get(layer_idx).copied());
             let ffn_out: Vec<Vec<f32>> = normed.iter()
-                .map(|x| dual_maestro_ffn_forward(&block.ffn, x))
+                .map(|x| dual_maestro_ffn_forward_with_memory(&block.ffn, x, mem))
                 .collect();
 
             hidden = (0..t).map(|i| {
@@ -579,7 +673,7 @@ impl ModelWeights {
 
     /// Generate one token using KV-cache. O(1) per layer instead of O(T).
     /// Only processes the new position against cached phases/values.
-    pub fn forward_one_cached(&self, token: usize, pos: usize, cache: &mut KvCache) -> Vec<f32> {
+    pub fn forward_one_cached(&self, token: usize, pos: usize, cache: &mut KvCache, memory_offsets: Option<&[(&[f32], &[f32])]>) -> Vec<f32> {
         let n_embd = self.config.n_embd();
         let n_bands = self.config.n_bands;
         let n_head = self.config.n_head;
@@ -671,8 +765,9 @@ impl ModelWeights {
             // Output projection for attention
             let attn_projected = linear(&block.attn.out_proj_w, &block.attn.out_proj_b, &attn_out);
 
-            // ─── FFN: process just this one token ───
-            let ffn_out = dual_maestro_ffn_forward(&block.ffn, &normed);
+            // ─── FFN: process just this one token (with memory if available) ───
+            let mem = memory_offsets.and_then(|m| m.get(layer_idx).copied());
+            let ffn_out = dual_maestro_ffn_forward_with_memory(&block.ffn, &normed, mem);
 
             // Parallel residual
             for j in 0..n_embd { h[j] = h[j] + attn_projected[j] + ffn_out[j]; }
@@ -689,7 +784,8 @@ impl ModelWeights {
         logits
     }
 
-    /// Extract ODE states for memory accumulation.
+    /// Extract ODE OUTPUT states for memory accumulation (Fix 2: captures ODE output, not input).
+    /// Full forward pass — use extract_ode_states_from_cache() when KV-cache is available.
     pub fn extract_ode_states(&self, tokens: &[usize]) -> Vec<(Vec<f32>, Vec<f32>)> {
         let n_embd = self.config.n_embd();
         let n_bands = self.config.n_bands;
@@ -712,22 +808,18 @@ impl ModelWeights {
 
             let attn_out = wave_attention_forward(&block.attn, &normed, n_bands);
 
-            // FFN: capture ODE state before out_proj
-            let ffn_out: Vec<Vec<f32>> = normed.iter()
-                .map(|x| dual_maestro_ffn_forward(&block.ffn, x))
-                .collect();
-
-            // Average ODE states across positions for memory
+            // FFN with ODE output extraction — captures post-RK4 dynamics
             let mut avg_r = vec![0.0f32; n_bands];
             let mut avg_s = vec![0.0f32; n_bands];
+            let mut ffn_out = Vec::with_capacity(t);
             for pos in 0..t {
-                // Use precond as proxy for ODE input state
-                let mae_in = maestro_forward(&block.ffn.maestro_in, &normed[pos]);
-                let precond: Vec<f32> = (0..n_embd).map(|i| normed[pos][i] + mae_in[i]).collect();
+                let (fout, ode_out) = dual_maestro_ffn_forward_extract(&block.ffn, &normed[pos], None);
+                // Accumulate ODE OUTPUT (the transformed representation)
                 for k in 0..n_bands {
-                    avg_r[k] += precond[k * 2];
-                    avg_s[k] += precond[k * 2 + 1];
+                    avg_r[k] += ode_out[k * 2];
+                    avg_s[k] += ode_out[k * 2 + 1];
                 }
+                ffn_out.push(fout);
             }
             let scale = 1.0 / t as f32;
             for k in 0..n_bands { avg_r[k] *= scale; avg_s[k] *= scale; }
@@ -738,6 +830,37 @@ impl ModelWeights {
                 for j in 0..n_embd { v[j] = hidden[i][j] + attn_out[i][j] + ffn_out[i][j]; }
                 v
             }).collect();
+        }
+
+        ode_states
+    }
+
+    /// Extract ODE states from KV-cache (Fix 3: no duplicate forward pass).
+    /// Uses last position's hidden state from each layer. Runs only the FFN
+    /// (maestro_in + ODE) per layer — not the full model.
+    pub fn extract_ode_states_from_cache(&self, cache: &KvCache) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let n_embd = self.config.n_embd();
+        let n_bands = self.config.n_bands;
+        let mut ode_states = Vec::new();
+
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            let hidden = &cache.hidden_per_layer[layer_idx];
+            if hidden.is_empty() {
+                ode_states.push((vec![0.0; n_bands], vec![0.0; n_bands]));
+                continue;
+            }
+            // Use last position (most recent context)
+            let last = &hidden[hidden.len() - 1];
+            let normed = layer_norm(last, &block.ln.weight, &block.ln.bias);
+            let (_ffn_out, ode_out) = dual_maestro_ffn_forward_extract(&block.ffn, &normed, None);
+
+            let mut r = vec![0.0f32; n_bands];
+            let mut s = vec![0.0f32; n_bands];
+            for k in 0..n_bands {
+                r[k] = ode_out[k * 2];
+                s[k] = ode_out[k * 2 + 1];
+            }
+            ode_states.push((r, s));
         }
 
         ode_states

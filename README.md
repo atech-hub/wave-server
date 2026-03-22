@@ -30,6 +30,78 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
+## Examples
+
+### Step 1: Train a model with wave-engine
+
+You need a trained checkpoint first. In the [wave-engine](https://github.com/atech-hub/wave-engine) repo:
+
+```bash
+cargo run --release -- data/input.txt --layers 4 --iters 200
+# Produces: checkpoint.bin
+```
+
+### Step 2: Serve it
+
+```bash
+# Character-level model (uses the same data file for vocabulary)
+cargo run --release -- checkpoint.bin data/input.txt --port 8080
+
+# BPE model (uses tokenizer.json instead of data file)
+cargo run --release -- checkpoint.bin --bpe data/tokenizer.json --port 8080
+```
+
+The server reads the model architecture from the checkpoint header (WCHK format) — no need to specify layers, dimensions, or any config flags.
+
+### Step 3: Test it
+
+```bash
+# Health check
+curl http://localhost:8080/health
+
+# Generate text
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Tell me about the ocean"}],"max_tokens":100}'
+
+# Stream tokens in real-time
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"stream":true}'
+```
+
+### Step 4: Connect a chat UI
+
+Point any OpenAI-compatible chat application to `http://localhost:8080/v1`:
+
+- **LM Studio** — Override Base URL → `http://127.0.0.1:8080/v1`
+- **Open WebUI** — Settings → Connections → add `http://127.0.0.1:8080/v1`
+- **SillyTavern / continue.dev** — API base URL → `http://127.0.0.1:8080/v1`
+
+### With API key protection
+
+```bash
+# Start server with auth
+cargo run --release -- checkpoint.bin data/input.txt --port 8080 --api-key sk-my-secret-key
+
+# Requests now require the key
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-my-secret-key" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
+```
+
+### With wave memory (experience accumulation)
+
+```bash
+# First run — creates fresh memory file
+cargo run --release -- checkpoint.bin data/input.txt --memory memory.kwmf --port 8080
+
+# Model accumulates experience across conversations.
+# Stop and restart — memory persists in the .kwmf file.
+# The model weights never change, only the memory file grows.
+```
+
 ## Features
 
 | Feature | Status | Description |

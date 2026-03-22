@@ -8,6 +8,12 @@
 # Wave memory files
 *.kwmf
 
+# Internal specs (implementation notes, not public docs)
+MEMORY-FIXES-SPEC.md
+
+# Test data
+requests.jsonl
+
 # IDE
 .vscode/
 .idea/

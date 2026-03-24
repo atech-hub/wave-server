@@ -225,15 +225,42 @@ fn softplus(x: f32) -> f32 {
 // ─── Embedding ──────────────────────────────────────────────
 
 /// Build frozen harmonic embedding table.
+/// Find two coprime moduli near sqrt(vocab_size) whose product >= vocab_size.
+/// Sexagenary principle: small incommensurate grids cover more than one large grid.
+fn find_coprime_moduli(vocab_size: usize) -> (usize, usize) {
+    fn gcd(mut a: usize, mut b: usize) -> usize {
+        while b != 0 { let t = b; b = a % b; a = t; } a
+    }
+    let root = (vocab_size as f64).sqrt().ceil() as usize;
+    let mut m1 = root;
+    if m1 % 2 == 0 { m1 += 1; }
+    let mut m2 = m1 + 2;
+    while gcd(m1, m2) != 1 || m1 * m2 < vocab_size { m2 += 1; }
+    (m1, m2)
+}
+
+/// Multi-grid harmonic embeddings — must match wave-engine/src/common/embed.rs exactly.
+/// Grid 1 (half bands): tok mod m1 on m1-circle.
+/// Grid 2 (half bands): tok mod m2 on m2-circle.
 pub fn build_harmonic_table(vocab_size: usize, n_bands: usize) -> Vec<Vec<f32>> {
     let n_embd = n_bands * 2;
+    let half = n_bands / 2;
+    let (m1, m2) = find_coprime_moduli(vocab_size);
+    eprintln!("  [embed] Multi-grid: m1={}, m2={}, lcm_coverage={}, vocab={}", m1, m2, m1 * m2, vocab_size);
     (0..vocab_size).map(|tok| {
-        let theta = tok as f32 * 2.0 * PI / vocab_size as f32;
         let mut emb = vec![0.0f32; n_embd];
-        for n in 0..n_bands {
-            let phase = (n + 1) as f32 * theta;
+        let theta1 = (tok % m1) as f32 * 2.0 * PI / m1 as f32;
+        for n in 0..half {
+            let phase = (n + 1) as f32 * theta1;
             emb[n * 2] = phase.cos();
             emb[n * 2 + 1] = phase.sin();
+        }
+        let theta2 = (tok % m2) as f32 * 2.0 * PI / m2 as f32;
+        for n in 0..half {
+            let idx = half + n;
+            let phase = (n + 1) as f32 * theta2;
+            emb[idx * 2] = phase.cos();
+            emb[idx * 2 + 1] = phase.sin();
         }
         emb
     }).collect()
@@ -466,6 +493,19 @@ fn dual_maestro_ffn_forward_with_memory(
         }
     }
 
+    // Per-band magnitude clamp — must match wave-engine/src/common/ffn.rs
+    let max_band_mag = 2.5f32;
+    for k in 0..n_bands {
+        let r = precond[k * 2];
+        let s = precond[k * 2 + 1];
+        let mag_sq = r * r + s * s;
+        if mag_sq > max_band_mag * max_band_mag {
+            let scale = max_band_mag / mag_sq.sqrt();
+            precond[k * 2] *= scale;
+            precond[k * 2 + 1] *= scale;
+        }
+    }
+
     // Kerr ODE
     let kerr_out = kerr_ode_forward(&weights.kerr, &precond);
 
@@ -495,6 +535,19 @@ fn dual_maestro_ffn_forward_extract(
         for k in 0..n_bands {
             precond[k * 2] += r_off[k];
             precond[k * 2 + 1] += s_off[k];
+        }
+    }
+
+    // Per-band magnitude clamp — must match wave-engine/src/common/ffn.rs
+    let max_band_mag = 2.5f32;
+    for k in 0..n_bands {
+        let r = precond[k * 2];
+        let s = precond[k * 2 + 1];
+        let mag_sq = r * r + s * s;
+        if mag_sq > max_band_mag * max_band_mag {
+            let scale = max_band_mag / mag_sq.sqrt();
+            precond[k * 2] *= scale;
+            precond[k * 2 + 1] *= scale;
         }
     }
 

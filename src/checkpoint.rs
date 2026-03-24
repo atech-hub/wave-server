@@ -54,20 +54,25 @@ fn read_f32_vec(f: &mut std::fs::File, n: usize) -> Vec<f32> {
 
 fn load_wchk(file: &mut std::fs::File, config_override: Option<ModelConfig>) -> (ModelWeights, u64, f32) {
     let version = read_u32(file);
-    assert_eq!(version, 1, "Unknown WCHK version {version}");
+    assert!(version == 1 || version == 2, "Unknown WCHK version {version}");
 
     let config = if let Some(c) = config_override {
-        for _ in 0..6 { read_u32(file); }
+        // Skip config fields: 6 for v1, 7 for v2
+        let n_fields = if version >= 2 { 7 } else { 6 };
+        for _ in 0..n_fields { read_u32(file); }
         c
     } else {
-        ModelConfig {
+        let c = ModelConfig {
             n_bands: read_u32(file) as usize,
             n_head: read_u32(file) as usize,
             n_layers: read_u32(file) as usize,
             maestro_dim: read_u32(file) as usize,
             block_size: read_u32(file) as usize,
             rk4_n_steps: read_u32(file) as usize,
-        }
+        };
+        // v2 adds out_proj_groups (read and discard — server reconstructs from weights)
+        if version >= 2 { let _out_proj_groups = read_u32(file); }
+        c
     };
     config.validate();
 

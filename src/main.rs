@@ -7,22 +7,29 @@
 //! v1 checkpoints need architecture flags to match the training config.
 //! BPE mode (--bpe tokenizer.json) does not require a data file.
 
-mod api_types;
-mod bpe;
-mod checkpoint;
-mod data;
-mod handlers;
-mod help;
-mod inference;
-mod model;
-mod prompt;
-mod rng;
-mod server;
+mod common;
+mod server_tier;
 
 #[cfg(feature = "gpu")]
-mod gpu;
+mod gpu_tier;
+
+// Re-export shims — existing code uses crate::model, crate::bpe, etc.
+pub use common::model;
+pub use common::bpe;
+pub use common::checkpoint;
+pub use common::data;
+pub use common::rng;
+pub use common::help;
+pub use server_tier::server;
+pub use server_tier::handlers;
+pub use server_tier::inference;
+pub use server_tier::api_types;
+pub use server_tier::prompt;
+
 #[cfg(feature = "gpu")]
-mod gpu_forward;
+pub use gpu_tier::gpu;
+#[cfg(feature = "gpu")]
+pub use gpu_tier::gpu_forward;
 
 use std::sync::Arc;
 

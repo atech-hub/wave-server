@@ -214,8 +214,8 @@ fn unflatten_to_model(config: &ModelConfig, vocab_size: usize, out_proj_groups: 
         block.ffn.maestro_out.squeeze.b.copy_from_slice(&params[idx..idx+md]); idx += md;
         for row in &mut block.ffn.maestro_out.process_1.w { row.copy_from_slice(&params[idx..idx+md]); idx += md; }
         block.ffn.maestro_out.process_1.b.copy_from_slice(&params[idx..idx+n_embd]); idx += n_embd;
-        // Block-diagonal out_proj: 6 groups × (group_size×group_size weight + group_size bias)
-        let gs = n_embd / 6;
+        // Block-diagonal out_proj: groups from checkpoint header
+        let gs = block.ffn.out_proj.group_size;
         for g in &mut block.ffn.out_proj.groups {
             for row in &mut g.w { row.copy_from_slice(&params[idx..idx+gs]); idx += gs; }
             g.b.copy_from_slice(&params[idx..idx+gs]); idx += gs;

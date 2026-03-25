@@ -56,11 +56,11 @@ fn load_wchk(file: &mut std::fs::File, config_override: Option<ModelConfig>) -> 
     let version = read_u32(file);
     assert!(version == 1 || version == 2, "Unknown WCHK version {version}");
 
-    let config = if let Some(c) = config_override {
+    let (config, out_proj_groups) = if let Some(c) = config_override {
         // Skip config fields: 6 for v1, 7 for v2
         let n_fields = if version >= 2 { 7 } else { 6 };
         for _ in 0..n_fields { read_u32(file); }
-        c
+        (c, 6) // default groups for override
     } else {
         let c = ModelConfig {
             n_bands: read_u32(file) as usize,
@@ -70,9 +70,8 @@ fn load_wchk(file: &mut std::fs::File, config_override: Option<ModelConfig>) -> 
             block_size: read_u32(file) as usize,
             rk4_n_steps: read_u32(file) as usize,
         };
-        // v2 adds out_proj_groups (read and discard — server reconstructs from weights)
-        if version >= 2 { let _out_proj_groups = read_u32(file); }
-        c
+        let out_proj_groups = if version >= 2 { read_u32(file) as usize } else { 6 };
+        (c, out_proj_groups)
     };
     config.validate();
 
@@ -81,14 +80,14 @@ fn load_wchk(file: &mut std::fs::File, config_override: Option<ModelConfig>) -> 
     let lr = read_f32_single(file);
     let _rng_state = read_u64(file);
 
-    let n_trainable = count_trainable_params(&config, vocab_size);
+    let n_trainable = count_trainable_params(&config, vocab_size, out_proj_groups);
 
     // Skip optimizer state (adam_t + m + v)
     let _adam_t = read_u64(file);
     file.seek(SeekFrom::Current((n_trainable * 2 * 4) as i64)).unwrap();
 
     let params = read_f32_vec(file, n_trainable);
-    let model = unflatten_to_model(&config, vocab_size, &params);
+    let model = unflatten_to_model(&config, vocab_size, out_proj_groups, &params);
 
     println!("  WCHK checkpoint: {} params, iter {iter}, lr {lr:.6}", params.len());
     println!("  Config: {}bands × {}head × {}layers = {}dim",
@@ -121,14 +120,15 @@ fn load_kchk(file: &mut std::fs::File, config_override: Option<ModelConfig>) -> 
     let lr = read_f32_single(file);
 
     eprintln!("  KCHK v{version}: vocab={vocab_size}, iter={iter} — using empty weights (architecture mismatch)");
-    let model = create_empty_model(&config, vocab_size);
+    let model = create_empty_model(&config, vocab_size, 6); // KCHK default
     (model, iter, lr)
 }
 
 /// Count trainable parameters (matches wave-engine's flatten_params layout).
-fn count_trainable_params(config: &ModelConfig, vocab_size: usize) -> usize {
+fn count_trainable_params(config: &ModelConfig, vocab_size: usize, out_proj_groups: usize) -> usize {
     let n_embd = config.n_embd();
     let md = config.maestro_dim;
+    let gs = n_embd / out_proj_groups.max(1);
 
     let per_block =
         n_embd * 2 +              // ln
@@ -137,12 +137,12 @@ fn count_trainable_params(config: &ModelConfig, vocab_size: usize) -> usize {
         n_embd * md + n_embd +    // mae_in process
         md * n_embd + md +        // mae_out squeeze
         n_embd * md + n_embd +    // mae_out process
-        6 * ((n_embd/6) * (n_embd/6) + (n_embd/6)); // block-diagonal out_proj (6 groups)
+        out_proj_groups * (gs * gs + gs); // block-diagonal out_proj
 
     config.n_layers * per_block + n_embd * 2 + vocab_size * n_embd
 }
 
-fn create_empty_model(config: &ModelConfig, vocab_size: usize) -> ModelWeights {
+fn create_empty_model(config: &ModelConfig, vocab_size: usize, out_proj_groups: usize) -> ModelWeights {
     let n_embd = config.n_embd();
     let n_bands = config.n_bands;
     let md = config.maestro_dim;
@@ -173,7 +173,7 @@ fn create_empty_model(config: &ModelConfig, vocab_size: usize) -> ModelWeights {
                 maestro_in: MaestroWeights { squeeze: make_linear(md, n_embd), process_1: make_linear(n_embd, md) },
                 maestro_out: MaestroWeights { squeeze: make_linear(md, n_embd), process_1: make_linear(n_embd, md) },
                 out_proj: {
-                    let n_groups = 6; // matches wave-engine's 6-group config
+                    let n_groups = out_proj_groups;
                     let group_size = n_embd / n_groups;
                     BlockDiagonalWeights {
                         groups: (0..n_groups).map(|_| make_linear(group_size, group_size)).collect(),
@@ -195,8 +195,8 @@ fn create_empty_model(config: &ModelConfig, vocab_size: usize) -> ModelWeights {
     }
 }
 
-fn unflatten_to_model(config: &ModelConfig, vocab_size: usize, params: &[f32]) -> ModelWeights {
-    let mut model = create_empty_model(config, vocab_size);
+fn unflatten_to_model(config: &ModelConfig, vocab_size: usize, out_proj_groups: usize, params: &[f32]) -> ModelWeights {
+    let mut model = create_empty_model(config, vocab_size, out_proj_groups);
     let n_embd = config.n_embd();
     let md = config.maestro_dim;
     let mut idx = 0;

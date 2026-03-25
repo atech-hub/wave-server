@@ -9,6 +9,36 @@
 
 use std::f32::consts::PI;
 
+/// Global AGC for inference — matches wave-engine training regulation.
+static AGC: std::sync::LazyLock<std::sync::Mutex<crate::common::agc::OdeAgc>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::new()));
+
+/// Apply AGC knee compression to preconditioned input before ODE.
+fn agc_process(precond: &mut [f32], n_bands: usize) {
+    // Collect magnitudes, observe, compress — same as engine
+    let mags: Vec<f32> = (0..n_bands).map(|k| {
+        let r = precond[k * 2];
+        let s = precond[k * 2 + 1];
+        (r * r + s * s).sqrt()
+    }).collect();
+    let mut agc = AGC.lock().unwrap();
+    agc.observe(&mags);
+    let threshold = agc.threshold;
+    drop(agc); // release lock before compression loop
+    for k in 0..n_bands {
+        let r = precond[k * 2];
+        let s = precond[k * 2 + 1];
+        let mag = (r * r + s * s).sqrt();
+        if mag > threshold && mag > 0.001 {
+            let excess = mag - threshold;
+            let compressed = threshold + threshold * (excess / threshold).tanh();
+            let scale = compressed / mag;
+            precond[k * 2] *= scale;
+            precond[k * 2 + 1] *= scale;
+        }
+    }
+}
+
 // ─── Model configuration ──────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
@@ -493,19 +523,8 @@ fn dual_maestro_ffn_forward_with_memory(
         }
     }
 
-    // Soft clamp (tanh compression) — must match wave-engine/src/common/ffn.rs
-    let threshold = 5.0f32;
-    for k in 0..n_bands {
-        let r = precond[k * 2];
-        let s = precond[k * 2 + 1];
-        let mag = (r * r + s * s).sqrt();
-        if mag > 0.001 {
-            let compressed = threshold * (mag / threshold).tanh();
-            let scale = compressed / mag;
-            precond[k * 2] *= scale;
-            precond[k * 2 + 1] *= scale;
-        }
-    }
+    // AGC knee compression — must match wave-engine/src/common/ffn.rs
+    agc_process(&mut precond, n_bands);
 
     // Kerr ODE
     let kerr_out = kerr_ode_forward(&weights.kerr, &precond);
@@ -539,19 +558,8 @@ fn dual_maestro_ffn_forward_extract(
         }
     }
 
-    // Soft clamp (tanh compression) — must match wave-engine/src/common/ffn.rs
-    let threshold = 5.0f32;
-    for k in 0..n_bands {
-        let r = precond[k * 2];
-        let s = precond[k * 2 + 1];
-        let mag = (r * r + s * s).sqrt();
-        if mag > 0.001 {
-            let compressed = threshold * (mag / threshold).tanh();
-            let scale = compressed / mag;
-            precond[k * 2] *= scale;
-            precond[k * 2 + 1] *= scale;
-        }
-    }
+    // AGC knee compression — must match wave-engine/src/common/ffn.rs
+    agc_process(&mut precond, n_bands);
 
     let kerr_out = kerr_ode_forward(&weights.kerr, &precond);
     let mae_out = maestro_forward(&weights.maestro_out, &kerr_out);

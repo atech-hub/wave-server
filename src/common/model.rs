@@ -9,22 +9,10 @@
 
 use std::f32::consts::PI;
 
-/// Global AGC for inference — matches wave-engine training regulation.
-static AGC: std::sync::LazyLock<std::sync::Mutex<crate::common::agc::OdeAgc>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::common::agc::OdeAgc::new()));
-
-/// Apply AGC knee compression to preconditioned input before ODE.
-fn agc_process(precond: &mut [f32], n_bands: usize) {
-    // Collect magnitudes, observe, compress — same as engine
-    let mags: Vec<f32> = (0..n_bands).map(|k| {
-        let r = precond[k * 2];
-        let s = precond[k * 2 + 1];
-        (r * r + s * s).sqrt()
-    }).collect();
-    let mut agc = AGC.lock().unwrap();
-    agc.observe(&mags);
-    let threshold = agc.threshold;
-    drop(agc); // release lock before compression loop
+/// Inference-only knee compressor — fixed threshold at ODE stability ceiling.
+/// No EMA, no adaptation. Training AGC adapts; inference uses the proven ceiling.
+fn knee_compress(precond: &mut [f32], n_bands: usize) {
+    let threshold = 6.0f32; // ODE stability ceiling: M < sqrt(pi/2 / 0.05) ≈ 5.6, rounded to 6.0
     for k in 0..n_bands {
         let r = precond[k * 2];
         let s = precond[k * 2 + 1];
@@ -523,8 +511,8 @@ fn dual_maestro_ffn_forward_with_memory(
         }
     }
 
-    // AGC knee compression — must match wave-engine/src/common/ffn.rs
-    agc_process(&mut precond, n_bands);
+    // Knee compression at ODE stability ceiling — matches engine's AGC ceiling
+    knee_compress(&mut precond, n_bands);
 
     // Kerr ODE
     let kerr_out = kerr_ode_forward(&weights.kerr, &precond);
@@ -558,8 +546,8 @@ fn dual_maestro_ffn_forward_extract(
         }
     }
 
-    // AGC knee compression — must match wave-engine/src/common/ffn.rs
-    agc_process(&mut precond, n_bands);
+    // Knee compression at ODE stability ceiling — matches engine's AGC ceiling
+    knee_compress(&mut precond, n_bands);
 
     let kerr_out = kerr_ode_forward(&weights.kerr, &precond);
     let mae_out = maestro_forward(&weights.maestro_out, &kerr_out);

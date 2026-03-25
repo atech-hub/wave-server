@@ -493,14 +493,15 @@ fn dual_maestro_ffn_forward_with_memory(
         }
     }
 
-    // Per-band magnitude clamp — must match wave-engine/src/common/ffn.rs
-    let max_band_mag = 2.5f32;
+    // Soft clamp (tanh compression) — must match wave-engine/src/common/ffn.rs
+    let threshold = 5.0f32;
     for k in 0..n_bands {
         let r = precond[k * 2];
         let s = precond[k * 2 + 1];
-        let mag_sq = r * r + s * s;
-        if mag_sq > max_band_mag * max_band_mag {
-            let scale = max_band_mag / mag_sq.sqrt();
+        let mag = (r * r + s * s).sqrt();
+        if mag > 0.001 {
+            let compressed = threshold * (mag / threshold).tanh();
+            let scale = compressed / mag;
             precond[k * 2] *= scale;
             precond[k * 2 + 1] *= scale;
         }
@@ -538,14 +539,15 @@ fn dual_maestro_ffn_forward_extract(
         }
     }
 
-    // Per-band magnitude clamp — must match wave-engine/src/common/ffn.rs
-    let max_band_mag = 2.5f32;
+    // Soft clamp (tanh compression) — must match wave-engine/src/common/ffn.rs
+    let threshold = 5.0f32;
     for k in 0..n_bands {
         let r = precond[k * 2];
         let s = precond[k * 2 + 1];
-        let mag_sq = r * r + s * s;
-        if mag_sq > max_band_mag * max_band_mag {
-            let scale = max_band_mag / mag_sq.sqrt();
+        let mag = (r * r + s * s).sqrt();
+        if mag > 0.001 {
+            let compressed = threshold * (mag / threshold).tanh();
+            let scale = compressed / mag;
             precond[k * 2] *= scale;
             precond[k * 2 + 1] *= scale;
         }

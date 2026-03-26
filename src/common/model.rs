@@ -9,10 +9,9 @@
 
 use std::f32::consts::PI;
 
-/// Inference-only knee compressor — fixed threshold at ODE stability ceiling.
-/// No EMA, no adaptation. Training AGC adapts; inference uses the proven ceiling.
-fn knee_compress(precond: &mut [f32], n_bands: usize) {
-    let threshold = 6.0f32; // ODE stability ceiling: M < sqrt(pi/2 / 0.05) ≈ 5.6, rounded to 6.0
+/// Inference-only knee compressor — threshold derived from model's coupling constants.
+/// No EMA, no adaptation. Ceiling = sqrt(pi/2 / (alpha + 4*beta)).
+fn knee_compress(precond: &mut [f32], n_bands: usize, threshold: f32) {
     for k in 0..n_bands {
         let r = precond[k * 2];
         let s = precond[k * 2 + 1];
@@ -511,8 +510,9 @@ fn dual_maestro_ffn_forward_with_memory(
         }
     }
 
-    // Knee compression at ODE stability ceiling — matches engine's AGC ceiling
-    knee_compress(&mut precond, n_bands);
+    // Knee compression — ceiling derived from model's coupling constants
+    let ceiling = (std::f32::consts::FRAC_PI_2 / (weights.kerr.alpha + 4.0 * weights.kerr.beta)).sqrt();
+    knee_compress(&mut precond, n_bands, ceiling);
 
     // Kerr ODE
     let kerr_out = kerr_ode_forward(&weights.kerr, &precond);
@@ -546,8 +546,9 @@ fn dual_maestro_ffn_forward_extract(
         }
     }
 
-    // Knee compression at ODE stability ceiling — matches engine's AGC ceiling
-    knee_compress(&mut precond, n_bands);
+    // Knee compression — ceiling derived from model's coupling constants
+    let ceiling = (std::f32::consts::FRAC_PI_2 / (weights.kerr.alpha + 4.0 * weights.kerr.beta)).sqrt();
+    knee_compress(&mut precond, n_bands, ceiling);
 
     let kerr_out = kerr_ode_forward(&weights.kerr, &precond);
     let mae_out = maestro_forward(&weights.maestro_out, &kerr_out);
